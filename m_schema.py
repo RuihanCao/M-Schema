@@ -164,6 +164,73 @@ class MSchema:
 
         return '\n'.join(output)
 
+    def to_ddl(self, selected_tables: List = None, example_num=3) -> str:
+        """
+        convert to DDL string.
+        selected_tables: 默认为None，表示选择所有的表
+        """
+        output = []
+
+        if selected_tables is not None:
+            selected_tables = [s.lower() for s in selected_tables]
+
+        # 依次处理每一个表
+        for table_name, table_info in self.tables.items():
+            if selected_tables is None or table_name.lower() in selected_tables:
+                output.append(f" CREATE TABLE {table_name} (")
+                
+                field_lines = []
+                pks = []
+                
+                for field_name, field_info in table_info['fields'].items():
+                    raw_type = self.get_field_type(field_info['type'], True) 
+                    
+                    line = f" {field_name} {raw_type.lower()}"
+                    
+                    if field_info.get('primary_key', False):
+                        pks.append(field_name)
+                    
+                    # Examples as comment
+                    if len(field_info.get('examples', [])) > 0 and example_num > 0:
+                        examples = field_info['examples']
+                        examples = [s for s in examples if s is not None]
+                        examples = examples_to_str(examples)
+                        if len(examples) > example_num:
+                            examples = examples[:example_num]
+                        
+                        if len(examples) > 0:
+                            example_str = ', '.join([f"'{e}'" if isinstance(e, str) else str(e) for e in examples])
+                            
+                            ex_str_list = []
+                            for ex in examples:
+                                if isinstance(ex, str) and not ex.isdigit(): 
+                                    if 'int' in raw_type.lower() or 'real' in raw_type.lower() or 'float' in raw_type.lower() or 'numeric' in raw_type.lower():
+                                         ex_str_list.append(str(ex))
+                                    else:
+                                         ex_str_list.append(f"'{ex}'")
+                                else:
+                                    ex_str_list.append(str(ex))
+                            
+                            line += f", -- example: [{', '.join(ex_str_list)}]"
+                    
+                    field_lines.append(line)
+
+                # Primary Keys
+                if pks:
+                    field_lines.append(f" PRIMARY KEY ({', '.join(pks)})")
+                
+                # Foreign Keys (Constraints) 
+                for fk in self.foreign_keys:
+                    t1, c1, s2, t2, c2 = fk
+                    if t1 == table_name:
+                         constraint_name = f"fk_{t1.replace('.', '_')}_{c1}"                      
+                         field_lines.append(f" CONSTRAINT {constraint_name} FOREIGN KEY ({c1}) REFERENCES {t2} ({c2})")
+
+                output.append(',\n'.join(field_lines))
+                output.append(" );")
+
+        return '\n'.join(output)
+
     def dump(self):
         schema_dict = {
             "db_id": self.db_id,
