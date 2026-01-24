@@ -164,72 +164,130 @@ class MSchema:
 
         return '\n'.join(output)
 
-    def to_ddl(self, selected_tables: List = None, example_num=3) -> str:
+    def to_ddl(self, selected_tables: List = None, example_num=3, max_token=3500) -> str:
         """
         convert to DDL string.
         selected_tables: 默认为None，表示选择所有的表
+        max_token: default 3500. 
+                   Strategy: 
+                   1. Calculate DDL length without examples.
+                   2. If > max_token, return without examples.
+                   3. Try with 3 examples per column.
+                   4. If > max_token, try with 1 example per column.
+                   5. If still > max_token, return without examples.
         """
-        output = []
-
+        
         if selected_tables is not None:
             selected_tables = [s.lower() for s in selected_tables]
 
-        # 依次处理每一个表
-        for table_name, table_info in self.tables.items():
-            if selected_tables is None or table_name.lower() in selected_tables:
-                output.append(f" CREATE TABLE {table_name} (")
+        def get_estimated_tokens(text):
+            return len(text) // 4
+
+        def is_binary_type(field_type):
+            type_lower = field_type.lower()
+            return any(t in type_lower for t in ['blob', 'binary', 'bytea', 'image', 'varbinary'])
+
+        def format_examples(field_info, num_examples):
+            if num_examples <= 0:
+                return ""
+            
+            examples = field_info.get('examples', [])
+            if not examples:
+                return ""
                 
-                field_lines = []
-                pks = []
-                
-                for field_name, field_info in table_info['fields'].items():
-                    raw_type = self.get_field_type(field_info['type'], True) 
+            # Filter and truncate examples
+            processed_examples = []
+            for ex in examples:
+                if ex is None:
+                    continue
+                s_ex = str(ex)
+                if len(s_ex) > 50:
+                    s_ex = s_ex[:50] + "..."
+                processed_examples.append(s_ex)
+            
+            # Use utility to sort/filter further if needed, but here we just slice
+            if len(processed_examples) > num_examples:
+                processed_examples = processed_examples[:num_examples]
+
+            if not processed_examples:
+                return ""
+
+            # Check if it looks like a number to decide on quoting
+            # Re-using the logic from original code loosely, but simplifying for the new structure
+            # Original code check for numeric types to avoid quotes was specific.
+            # Here we follow the pattern: quote unless it's strictly numeric and we want to preserve that.
+            # But `examples` in field_info seems to come largely as strings or mixed.
+            # Let's rely on the simplified formatting:
+            
+            ex_str_list = []
+            raw_type = self.get_field_type(field_info['type'], True).lower()
+            is_numeric = 'int' in raw_type or 'real' in raw_type or 'float' in raw_type or 'numeric' in raw_type
+
+            for ex in processed_examples:
+                if is_numeric and ex.replace('.', '', 1).isdigit():
+                    ex_str_list.append(ex)
+                else:
+                    ex_str_list.append(f"'{ex}'")
+            
+            return f", -- example: [{', '.join(ex_str_list)}]"
+
+        def generate_ddl(num_examples_per_field):
+            output = []
+            for table_name, table_info in self.tables.items():
+                if selected_tables is None or table_name.lower() in selected_tables:
+                    output.append(f" CREATE TABLE {table_name} (")
                     
-                    line = f" {field_name} {raw_type.lower()}"
+                    field_lines = []
+                    pks = []
                     
-                    if field_info.get('primary_key', False):
-                        pks.append(field_name)
-                    
-                    # Examples as comment
-                    if len(field_info.get('examples', [])) > 0 and example_num > 0:
-                        examples = field_info['examples']
-                        examples = [s for s in examples if s is not None]
-                        examples = examples_to_str(examples)
-                        if len(examples) > example_num:
-                            examples = examples[:example_num]
+                    for field_name, field_info in table_info['fields'].items():
+                        raw_type = self.get_field_type(field_info['type'], True) 
+                        line = f" {field_name} {raw_type.lower()}"
                         
-                        if len(examples) > 0:
-                            example_str = ', '.join([f"'{e}'" if isinstance(e, str) else str(e) for e in examples])
-                            
-                            ex_str_list = []
-                            for ex in examples:
-                                if isinstance(ex, str) and not ex.isdigit(): 
-                                    if 'int' in raw_type.lower() or 'real' in raw_type.lower() or 'float' in raw_type.lower() or 'numeric' in raw_type.lower():
-                                         ex_str_list.append(str(ex))
-                                    else:
-                                         ex_str_list.append(f"'{ex}'")
-                                else:
-                                    ex_str_list.append(str(ex))
-                            
-                            line += f", -- example: [{', '.join(ex_str_list)}]"
+                        if field_info.get('primary_key', False):
+                            pks.append(field_name)
+                        
+                        # Add examples if requested and NOT binary
+                        if num_examples_per_field > 0 and not is_binary_type(field_info['type']):
+                            line += format_examples(field_info, num_examples_per_field)
+                        
+                        field_lines.append(line)
+
+                    # Primary Keys
+                    if pks:
+                        field_lines.append(f" PRIMARY KEY ({', '.join(pks)})")
                     
-                    field_lines.append(line)
+                    # Foreign Keys (Constraints) 
+                    for fk in self.foreign_keys:
+                        t1, c1, s2, t2, c2 = fk
+                        if t1 == table_name:
+                             constraint_name = f"fk_{t1.replace('.', '_')}_{c1}"                      
+                             field_lines.append(f" CONSTRAINT {constraint_name} FOREIGN KEY ({c1}) REFERENCES {t2} ({c2})")
 
-                # Primary Keys
-                if pks:
-                    field_lines.append(f" PRIMARY KEY ({', '.join(pks)})")
-                
-                # Foreign Keys (Constraints) 
-                for fk in self.foreign_keys:
-                    t1, c1, s2, t2, c2 = fk
-                    if t1 == table_name:
-                         constraint_name = f"fk_{t1.replace('.', '_')}_{c1}"                      
-                         field_lines.append(f" CONSTRAINT {constraint_name} FOREIGN KEY ({c1}) REFERENCES {t2} ({c2})")
+                    output.append(',\n'.join(field_lines))
+                    output.append(" );")
+            return '\n'.join(output)
 
-                output.append(',\n'.join(field_lines))
-                output.append(" );")
-
-        return '\n'.join(output)
+        # 1. Base DDL (0 examples)
+        base_ddl = generate_ddl(0)
+        base_tokens = get_estimated_tokens(base_ddl)
+        
+        if base_tokens > max_token:
+            return base_ddl
+            
+        # 3. Try 3 examples
+        try_3 = generate_ddl(example_num)
+        if get_estimated_tokens(try_3) <= max_token:
+            return try_3
+        
+        # 4. Try 1 example
+        if example_num > 1:
+            try_1 = generate_ddl(1)
+            if get_estimated_tokens(try_1) <= max_token:
+                return try_1
+        
+        # 5. Fallback to base
+        return base_ddl
 
     def dump(self):
         schema_dict = {
